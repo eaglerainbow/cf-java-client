@@ -34,6 +34,7 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.BiConsumer;
 import java.util.function.Consumer;
 import java.util.function.Function;
@@ -81,6 +82,10 @@ public abstract class AbstractUaaTokenProvider implements TokenProvider {
             new ConcurrentHashMap<>(1);
 
     private final ConcurrentMap<ConnectionContext, Mono<String>> refreshTokens =
+            new ConcurrentHashMap<>(1);
+
+    // Add locks per connection context to synchronize token refresh operations
+    private final ConcurrentMap<ConnectionContext, ReentrantLock> tokenRefreshLocks =
             new ConcurrentHashMap<>(1);
 
     /**
@@ -239,6 +244,10 @@ public abstract class AbstractUaaTokenProvider implements TokenProvider {
         return this.refreshTokenStreams.computeIfAbsent(connectionContext, c -> new RefreshToken());
     }
 
+    private ReentrantLock getTokenRefreshLock(ConnectionContext connectionContext) {
+        return this.tokenRefreshLocks.computeIfAbsent(connectionContext, c -> new ReentrantLock());
+    }
+
     private Mono<String> primaryToken(ConnectionContext connectionContext) {
         return requestToken(
                 connectionContext,
@@ -252,6 +261,10 @@ public abstract class AbstractUaaTokenProvider implements TokenProvider {
                         refreshTokenGrantTokenRequestTransformer(refreshToken),
                         tokensExtractor(connectionContext))
                 .doOnError(t -> LOGGER.error("Refresh token grant error.", t))
+                .doOnError(t -> {
+                    // Clear the refresh token on error to prevent reuse
+                    this.refreshTokens.remove(connectionContext);
+                })
                 .onErrorResume(t -> Mono.empty());
     }
 
@@ -297,31 +310,58 @@ public abstract class AbstractUaaTokenProvider implements TokenProvider {
         headers.set(AUTHORIZATION, String.format("Basic %s", encoded));
     }
 
-    private Mono<String> token(ConnectionContext connectionContext) {
-        Mono<String> cached =
-                this.refreshTokens
-                        .getOrDefault(connectionContext, Mono.empty())
-                        .flatMap(
-                                refreshToken ->
-                                        refreshToken(connectionContext, refreshToken)
-                                                .doOnSubscribe(
-                                                        s ->
-                                                                LOGGER.debug(
-                                                                        "Negotiating using refresh"
-                                                                                + " token")))
-                        .switchIfEmpty(
-                                primaryToken(connectionContext)
-                                        .doOnSubscribe(
-                                                s ->
-                                                        LOGGER.debug(
-                                                                "Negotiating using token"
-                                                                        + " provider")));
+    private Mono<String> tokenProtectedFromConcurrency(ConnectionContext connectionContext) {
+        // Check if another thread already refreshed the token while we waited
+        final Mono<String> currentToken = this.accessTokens.get(connectionContext);
+        if (currentToken != null && currentToken != this.accessTokens.computeIfAbsent(connectionContext, this::token)) {
+            return currentToken;
+        }
 
-        return connectionContext
+        // Token acquisition logic
+        final Mono<String> tokenMono = this.refreshTokens
+                .getOrDefault(connectionContext, Mono.empty())
+                .flatMap(refreshToken -> {
+                    // Clear the refresh token immediately to prevent concurrent use
+                    this.refreshTokens.remove(connectionContext);
+                    /*
+                     * Note: This removal might mean, that in case fetching
+                     * a new access token by using this refresh token fails, 
+                     * we may lose the refresh token (as we are not putting
+                     * it back to the ConcurrentMap anymore).
+                     * However, this should not turn out to be harmful,
+                     * as in this case, a "primary token" is fetched instead.
+                     */
+                    return refreshToken(connectionContext, refreshToken)
+                            .doOnSubscribe(s -> LOGGER.debug("Negotiating using refresh token"));
+                })
+                .switchIfEmpty(
+                        primaryToken(connectionContext)
+                                .doOnSubscribe(s -> LOGGER.debug("Negotiating using token provider")));
+
+        // Apply caching only to successful responses
+        // prevent that broken tokens are ever cached
+        final Mono<String> tokenMonoNonBroken = tokenMono
+                .filter(token -> token != null && !token.trim().isEmpty());
+        
+        final Mono<String> cached = connectionContext
                 .getCacheDuration()
-                .map(cached::cache)
-                .orElseGet(cached::cache)
+                .map(duration -> tokenMonoNonBroken.cache(duration))
+                .orElseGet(() -> tokenMonoNonBroken.cache())
                 .checkpoint();
+
+        return cached;
+    }
+    
+    private Mono<String> token(ConnectionContext connectionContext) {
+        return Mono.fromCallable(() -> {
+            final ReentrantLock lock = getTokenRefreshLock(connectionContext);
+            lock.lock();
+            try {
+                return tokenProtectedFromConcurrency(connectionContext);
+            } finally {
+                lock.unlock();
+            }
+        }).flatMap(mono -> mono);
     }
 
     @SuppressWarnings("unchecked")
